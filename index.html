@@ -2797,9 +2797,19 @@ var _imageMap      = {};   // docId (e.g. q1__item__i1) → base64 data string
 // Safe _db.collection wrapper — returns a dummy object if _db is null
 function _col(name){
   if(!_db) return {
-    doc:function(){return{set:function(){return Promise.resolve();},get:function(){return Promise.resolve({exists:false,data:function(){return{};}});},onSnapshot:function(){return function(){};},update:function(){return Promise.resolve();},delete:function(){return Promise.resolve();}};},
-    get:function(){return Promise.resolve({forEach:function(){},docs:[]});},
-    where:function(){return{get:function(){return Promise.resolve({forEach:function(){},docs:[]});}};},
+    doc:function(){return{
+      set:function(){return Promise.resolve();},
+      get:function(){return Promise.resolve({exists:false,data:function(){return{};},forEach:function(){}});},
+      onSnapshot:function(){return function(){};},
+      update:function(){return Promise.resolve();},
+      delete:function(){return Promise.resolve();}
+    };},
+    get:function(){return Promise.resolve({forEach:function(){},docs:[],size:0});},
+    onSnapshot:function(){return function(){};},
+    where:function(){return{
+      get:function(){return Promise.resolve({forEach:function(){},docs:[]});},
+      onSnapshot:function(){return function(){};}
+    };},
     add:function(){return Promise.resolve();},
     batch:function(){return{set:function(){return this;},commit:function(){return Promise.resolve();}};},
   };
@@ -12149,29 +12159,90 @@ function askDuplicateGRCType(quotId,groupId){
   popup.onclick=function(e){if(e.target===popup)popup.remove();};
 }
 
-function duplicateToGroup(quotId,groupId,newGrcType){
+async function duplicateToGroup(quotId,groupId,newGrcType){
   const quots=ls('quotations')||[];
   const src=quots.find(x=>x.id===quotId);if(!src){toast('Source quotation not found','error');return;}
+
+  // Deep copy all quotation data including sitePhotos[] and itemImages{}
   const copy=JSON.parse(JSON.stringify(src));
-  copy.id=uid();
+  const newId=uid();
+  copy.id=newId;
   copy.group=groupId;
   copy.status='draft';
   copy.date=today();
   copy.createdBy=currentUser?.id||copy.createdBy;
   copy.editHistory=[];
   copy.comments=[];
-  // Apply the selected GRC type
   if(newGrcType)copy.grcType=newGrcType;
-  // Give all items new IDs to avoid collisions
-  copy.items=(copy.items||[]).map(function(it){return Object.assign({},it,{id:uid()});});
-  copy.additionalCharges=(copy.additionalCharges||[]).map(function(c){return Object.assign({},c,{id:uid()});});
-  // Write to storage — fetch fresh array to avoid overwrite race
+
+  // Give all items new IDs — but keep a mapping from old→new item IDs
+  // so we can remap itemImages keys correctly
+  const itemIdMap={};
+  copy.items=(copy.items||[]).map(function(it){
+    const newItemId=uid();
+    itemIdMap[it.id]=newItemId;
+    return Object.assign({},it,{id:newItemId});
+  });
+  copy.additionalCharges=(copy.additionalCharges||[]).map(function(c){
+    return Object.assign({},c,{id:uid()});
+  });
+
+  // ── Copy images from _imageMap using old quotId keys → new quotId keys ──
+  // sitePhotos: {srcId}__photo__0, __photo__1, ...
+  // itemImages: {srcId}__item__{oldItemId}
+  const newSitePhotos=[];
+  const newItemImages={};
+
+  // Copy site photos — iterate _imageMap for this source quotation
+  var photoIdx=0;
+  while(true){
+    const oldKey=quotId+'__photo__'+photoIdx;
+    const imgData=_imageMap[oldKey];
+    if(!imgData)break; // no more photos
+    const newKey=newId+'__photo__'+photoIdx;
+    _imageMap[newKey]=imgData; // copy in memory
+    newSitePhotos.push(imgData);
+    photoIdx++;
+  }
+
+  // Copy item images — remap old item IDs to new item IDs
+  Object.keys(_imageMap).forEach(function(key){
+    const prefix=quotId+'__item__';
+    if(key.indexOf(prefix)===0){
+      const oldItemId=key.slice(prefix.length);
+      const newItemId=itemIdMap[oldItemId]||oldItemId; // use mapped ID or keep original
+      const newKey=newId+'__item__'+newItemId;
+      _imageMap[newKey]=_imageMap[key];
+      newItemImages[newItemId]=_imageMap[key];
+    }
+  });
+
+  // Update copy's sitePhotos and itemImages to reflect the duplicated data
+  if(newSitePhotos.length>0) copy.sitePhotos=newSitePhotos;
+  if(Object.keys(newItemImages).length>0) copy.itemImages=newItemImages;
+
+  // Write quotation to storage (without images — they're in _imageMap)
   const freshQuots=ls('quotations')||[];
   freshQuots.push(copy);
   ss('quotations',freshQuots);
-  toast('✅ Duplicated as "'+( newGrcType||copy.grcType)+'"! Click the group badge to see all quotations.','success');
+
+  // Save images to Firebase under the new quotation ID
+  if(_fsReady&&_db&&(newSitePhotos.length>0||Object.keys(newItemImages).length>0)){
+    try{
+      await _saveQuotImages(newId, newSitePhotos, newItemImages);
+      console.log('[Duplicate] Images copied to Firebase for new quotation '+newId);
+    }catch(e){
+      console.warn('[Duplicate] Image save to Firebase failed (they are still in memory):', e.message);
+    }
+  }
+
+  const photoCount=newSitePhotos.length;
+  const itemImgCount=Object.keys(newItemImages).length;
+  const imgMsg=( photoCount||itemImgCount)?' ('+( photoCount?' '+photoCount+' site photo'+(photoCount>1?'s':''):'')+( itemImgCount?' '+itemImgCount+' item image'+(itemImgCount>1?'s':''):'')+' copied)':'';
+  toast('✅ Duplicated as "'+( newGrcType||copy.grcType)+'"'+imgMsg+'!','success');
+
   // Re-open group popup so user can see the new duplicate
-  setTimeout(function(){openGroupPopupFromQuot(groupId,copy.id);},200);
+  setTimeout(function(){openGroupPopupFromQuot(groupId,newId);},200);
 }
 function addNewQuotToGroup(groupId){
   const g=(ls('groups')||[]).find(x=>x.id===groupId);if(!g)return;
