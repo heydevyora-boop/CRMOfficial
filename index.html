@@ -2352,14 +2352,15 @@ body.sidebar-collapsed #main{margin-left:52px!important;width:calc(100% - 52px)!
 
 <!-- ════ MODALS ════ -->
 <!-- LOGIN -->
-<div class="modal-overlay" id="loginModal">
+<div class="modal-overlay" id="loginModal" style="backdrop-filter:blur(4px)">
   <div class="modal" style="max-width:400px">
-    <div class="modal-header"><div class="modal-title">👤 Select User</div></div>
+    <div class="modal-header"><div class="modal-title">👤 Welcome to Devyora CRM</div></div>
     <div class="modal-body">
+      <div style="text-align:center;margin-bottom:16px;font-size:13px;color:var(--text3)">Select your account to continue</div>
       <div class="form-group" style="margin-bottom:12px"><label>Team Member</label><select id="loginSelect"></select></div>
       <div class="form-group"><label>Password</label><input type="password" id="loginPass" placeholder="Enter password" onkeydown="if(event.key==='Enter')doLogin()"></div>
     </div>
-    <div class="modal-footer"><button class="btn btn-secondary" onclick="closeModal('loginModal')">Cancel</button><button class="btn btn-primary" onclick="doLogin()">Login</button></div>
+    <div class="modal-footer"><button class="btn btn-primary" style="width:100%" onclick="doLogin()">Login →</button></div>
   </div>
 </div>
 
@@ -2767,18 +2768,20 @@ var _firebaseConfig = {
   appId: "1:417280090597:web:16889e15b2f000283f8f0c"
 };
 
-// Safe firebase init — if SDK not loaded (offline/local file), run in memory-only mode
+// Safe firebase init — deferred to ensure SDK scripts have loaded
 var _db = null;
-try {
-  if(typeof firebase !== 'undefined') {
-    try { firebase.initializeApp(_firebaseConfig); } catch(e) {}
-    _db = firebase.firestore();
-  } else {
-    console.warn('[CRM] Firebase SDK not loaded — running in offline/memory mode. Host this file on a server (Netlify) for full sync.');
+function _initFirebase(){
+  try {
+    if(typeof firebase !== 'undefined') {
+      try { firebase.initializeApp(_firebaseConfig); } catch(e) {}
+      _db = firebase.firestore();
+    } else {
+      console.warn('[CRM] Firebase SDK not loaded — running in offline/memory mode. Host this file on a server for full sync.');
+    }
+  } catch(e) {
+    console.warn('[CRM] Firebase init failed:', e.message);
+    _db = null;
   }
-} catch(e) {
-  console.warn('[CRM] Firebase init failed:', e.message, '— running in memory-only mode.');
-  _db = null;
 }
 var _fsReady  = false;
 var FS_KV          = 'crm_kv';           // settings, webhooks, users (small docs)
@@ -3727,7 +3730,22 @@ function importAllData(event){
 
 // ── AUTH ──
 function showLoginModal(){const u=ls('users')||[];document.getElementById('loginSelect').innerHTML=u.map(u=>`<option value="${u.id}">${u.name} (${u.role})</option>`).join('');document.getElementById('loginPass').value='';document.getElementById('loginModal').classList.add('open');}
-function doLogin(){const uid2=document.getElementById('loginSelect').value,pass=document.getElementById('loginPass').value,user=(ls('users')||[]).find(u=>u.id===uid2&&u.pass===pass);if(!user){toast('Wrong password','error');return;}setCurrentUser(user);closeModal('loginModal');toast(`Welcome, ${user.name}!`,'success');showStartupSummary();checkRewardsOnLogin();}
+function doLogin(){
+  const uid2=document.getElementById('loginSelect').value;
+  const pass=document.getElementById('loginPass').value;
+  const user=(ls('users')||[]).find(u=>u.id===uid2&&u.pass===pass);
+  if(!user){toast('Wrong password','error');return;}
+  setCurrentUser(user);
+  closeModal('loginModal');
+  loadSettings();
+  renderDashboard();
+  // Post-login tasks
+  if(ls('sheetURL'))setTimeout(()=>fetchSheetData(false),2500);
+  setInterval(()=>{updateBadge();updateApprovalBadge();},60000);
+  toast(`Welcome, ${user.name}!`,'success');
+  showStartupSummary();
+  checkRewardsOnLogin();
+}
 
 
 // ── STARTUP SUMMARY ──
@@ -3814,7 +3832,7 @@ function renderDashboard(){
   checkQTOverdueReminders();
   const allQuots=ls('quotations')||[];
   // TELECALLER ISOLATION: telecallers only see their own quotations everywhere
-  const myQuots=isTelecaller()?allQuots.filter(q=>q.telecallerId===currentUser.id):allQuots;
+  const myQuots=isTelecaller()?allQuots.filter(q=>_isMyQuotation(q)):allQuots;
   const pending=myQuots.filter(hasPendingRate);
   const myRevs=isTelecaller()?(ls('revisions')||[]).filter(r=>r.status==='open'&&r.requestedById===currentUser.id):(ls('revisions')||[]).filter(r=>r.status==='open');
 
@@ -3991,6 +4009,7 @@ function openNewQuotation(){
   qbData={id:null,client:'',phone:'',address:'',city:'',state:'',grcType:'White GRC Plain',siteStage:'Planning',telecaller:'',telecallerId:'',items:[newQItem(1)],additionalCharges:[{id:uid(),label:'Installation Charges',amount:''}],sitePhotos:[],itemImages:{},status:'draft',group:'',designerNote:'',adminNote:'',activeFormat:'standard',fmtCustom:{},date:today(),createdBy:currentUser?.id||'',comments:[],editHistory:[],bank:{name:s.bankHolder||'',bank:s.bankName||'',account:s.bankAcc||'',ifsc:s.bankIFSC||''},terms:['50% advance, 50% before delivery','Delivery within 21 working days','Rates valid for 30 days'],ssgData:null};
   populateQBForm();renderFmtPreviews();document.getElementById('quotModalTitle').textContent='📋 New Quotation';
   document.getElementById('quotModal').classList.add('open');renderQBContent();initSitePhotos();
+  startQuotAutoSave();
   document.getElementById('waSummarySection').style.display='none';document.getElementById('dupWarning').style.display='none';
   // Voice button visible to all; hide panel by default
   const vp=document.getElementById('voiceQuotPanel');if(vp)vp.style.display='none';
@@ -4014,6 +4033,7 @@ function openEditQuotation(id){
   populateQBForm();renderFmtPreviews();
   document.getElementById('quotModal').classList.add('open');
   renderQBContent();initSitePhotos();
+  startQuotAutoSave();
   document.getElementById('waSummarySection').style.display='none';
   document.getElementById('dupWarning').style.display='none';
   // Reset voice panel
@@ -4711,7 +4731,44 @@ function saveQuotation(mode){
   updateBadge();
 }
 
-// ── PDF / PRINT ──
+// ── AUTO-SAVE: Save quotation draft every 30 seconds while modal is open ──
+var _autoSaveTimer=null;
+function startQuotAutoSave(){
+  stopQuotAutoSave();
+  _autoSaveTimer=setInterval(function(){
+    if(!qbData||qbData._isTester||qbData.isSupervisorQuot)return;
+    if(!document.getElementById('quotModal')?.classList.contains('open'))return;
+    // Only auto-save if there's a client name (don't save blank drafts)
+    const clientName=document.getElementById('qClientName')?.value.trim();
+    if(!clientName)return;
+    // Silent save — update qbData from form fields then write to storage
+    try{
+      qbData.client=clientName;
+      qbData.phone=document.getElementById('qPhone')?.value||qbData.phone||'';
+      qbData.city=document.getElementById('qCity')?.value||qbData.city||'';
+      qbData.designerNote=document.getElementById('qDesignerNote')?.value||qbData.designerNote||'';
+      qbData.adminNote=document.getElementById('qAdminNote')?.value||qbData.adminNote||'';
+      qbData.status=qbData.status||'draft';
+      qbData.date=qbData.date||today();
+      if(!qbData.id)qbData.id=uid();
+      let quots=ls('quotations')||[];
+      const existing=quots.findIndex(x=>x.id===qbData.id);
+      if(existing>=0) quots[existing]=qbData;
+      else quots.push(qbData);
+      ss('quotations',quots);
+      // Show subtle indicator
+      const title=document.getElementById('quotModalTitle');
+      if(title){
+        const orig=title.textContent;
+        if(!orig.includes('💾'))title.textContent=orig+' 💾';
+        setTimeout(function(){if(title.textContent.endsWith(' 💾'))title.textContent=orig;},1500);
+      }
+    }catch(e){console.warn('[AutoSave] failed:',e.message);}
+  },30000); // every 30 seconds
+}
+function stopQuotAutoSave(){
+  if(_autoSaveTimer){clearInterval(_autoSaveTimer);_autoSaveTimer=null;}
+}
 function openPDFModal(quotId){pendingPDFQuotId=quotId;['pdfOpt1','pdfOpt2','pdfOpt3'].forEach((id,i)=>{document.getElementById(id).classList.toggle('active',i===0);});document.querySelectorAll('[name=pdfLayout]')[0].checked=true;document.getElementById('pdfModal').classList.add('open');}
 function selectPDFOpt(el){document.querySelectorAll('.pdf-option').forEach(o=>{o.classList.toggle('active',o.contains(el));});}
 function executePDFDownload(){const layout=document.querySelector('[name=pdfLayout]:checked')?.value||'portrait';closeModal('pdfModal');const q=(ls('quotations')||[]).find(x=>x.id===pendingPDFQuotId);if(!q)return;printQuotHTML(q,layout);}
@@ -5618,12 +5675,16 @@ function closeModal(id){
   document.getElementById(id).classList.remove('open');
   // Clean up quotation modal state when closed
   if(id==='quotModal'){
+    stopQuotAutoSave(); // stop auto-save when modal closes
     vtqStopAll();
     const vp=document.getElementById('voiceQuotPanel');if(vp)vp.style.display='none';
     // Don't reset qbData here — saveQuotation does it. Just stop voice.
   }
 }
-document.querySelectorAll('.modal-overlay').forEach(m=>{m.addEventListener('click',e=>{if(e.target===m)m.classList.remove('open');});});
+document.querySelectorAll('.modal-overlay').forEach(m=>{
+  if(m.id==='loginModal')return; // Login modal cannot be dismissed by clicking outside
+  m.addEventListener('click',e=>{if(e.target===m)m.classList.remove('open');});
+});
 
 // ── QUOTATION COLUMN EDITOR ──
 const DEFAULT_QUOT_COLS=[
@@ -6136,7 +6197,8 @@ function revertQuotStatus(id){
 // ======================================================
 function renderQuotations(){
   let quots=ls('quotations')||[];
-  if(isTelecaller())quots=quots.filter(q=>q.telecallerId===currentUser.id);
+  // TELECALLER ISOLATION: filter before rendering anything
+  if(isTelecaller()) quots=quots.filter(q=>_isMyQuotation(q));
   // Show pending approvals for admin at top
   if(isAdmin()){const pab=document.getElementById('pendingApprovalBox');if(pab)pab.innerHTML=renderPendingApprovals();}
   // ISOLATION: telecallers never see other telecaller filter chips
@@ -6148,10 +6210,24 @@ function renderQuotations(){
   }
   filterQuotations();
 }
+
+// Check if a quotation belongs to the current telecaller — dual check: id AND name
+function _isMyQuotation(q){
+  if(!currentUser||currentUser.role!=='telecaller')return true;
+  const myId=currentUser.id||'';
+  const myName=(currentUser.name||'').toLowerCase().trim();
+  // Match by ID (most reliable)
+  if(myId&&q.telecallerId&&q.telecallerId===myId)return true;
+  // Fallback: match by name (handles quotations created before ID was stored)
+  if(myName&&q.telecaller&&q.telecaller.toLowerCase().trim()===myName)return true;
+  // Quotations with empty telecallerId AND empty telecaller should NOT show for anyone
+  return false;
+}
 function setTCFilter(f,el){activeTCFilter=f;document.querySelectorAll('#telecallerFilterGroup .filter-chip').forEach(c=>c.classList.remove('active'));if(el)el.classList.add('active');filterQuotations();}
 function filterQuotations(){
   let quots=ls('quotations')||[];
-  if(isTelecaller())quots=quots.filter(q=>q.telecallerId===currentUser.id);
+  // Always apply telecaller isolation first — dual check: id AND name
+  if(isTelecaller()) quots=quots.filter(q=>_isMyQuotation(q));
   const qv=(document.getElementById('quotSearch').value||'').toLowerCase();
   if(qv)quots=quots.filter(x=>(x.client+x.grcType+x.city).toLowerCase().includes(qv));
   if(activeQuotFilter==='pending_rate')quots=quots.filter(hasPendingRate);
@@ -8087,6 +8163,21 @@ function normPhone(p){
   if(!s)return'';
   return s.length>10?s.slice(-10):s;
 }
+// Clean phone from webhook — reject non-numeric strings like "WhatsApp", "Phone", "N/A"
+// Only return value if it looks like an actual phone number (8-15 digits)
+function cleanLeadPhone(raw){
+  if(!raw)return'';
+  // If value is a known non-phone word, return empty
+  var lower=raw.toLowerCase().trim();
+  var nonPhone=['whatsapp','phone','mobile','cell','telephone','na','n/a','nil','none','unknown','--','-'];
+  if(nonPhone.indexOf(lower)>=0)return'';
+  // Extract digits only
+  var digits=raw.replace(/\D/g,'');
+  // Must have 8-15 digits to be a valid phone
+  if(digits.length<8||digits.length>15)return'';
+  // Return the original formatted value (keep + prefix if present) but without letters
+  return raw.replace(/[^\d+\-\s()]/g,'').trim()||digits;
+}
 
 // ── Parse sheet date string → YYYY-MM-DD for <input type="date"> ──
 // Handles: "Friday / 9th Jan / 2026 – 07:25 AM"  →  "2026-01-09"
@@ -8285,7 +8376,7 @@ function syncLeadsMasterFromWebhook(url, _releaseLock){
       });
       var changedLeads=[]; // new + actually-changed existing leads (will be batch-written to Firestore)
       rows.forEach(function(r){
-        const phone=String(r.leadContact||r.phone||'').trim();
+        const phone=cleanLeadPhone(String(r.leadContact||r.phone||'').trim());
         const name=String(r.leadName||r.name||'').trim();
         if(!name&&!phone)return;
         const sno=String(r.sno||'');
@@ -12163,7 +12254,8 @@ async function duplicateToGroup(quotId,groupId,newGrcType){
   const quots=ls('quotations')||[];
   const src=quots.find(x=>x.id===quotId);if(!src){toast('Source quotation not found','error');return;}
 
-  // Deep copy all quotation data including sitePhotos[] and itemImages{}
+  // Deep copy ALL quotation data — JSON.parse/stringify copies sitePhotos[] and itemImages{}
+  // because _restoreQuotImages already populated them from _imageMap when the quotation loaded
   const copy=JSON.parse(JSON.stringify(src));
   const newId=uid();
   copy.id=newId;
@@ -12175,8 +12267,7 @@ async function duplicateToGroup(quotId,groupId,newGrcType){
   copy.comments=[];
   if(newGrcType)copy.grcType=newGrcType;
 
-  // Give all items new IDs — but keep a mapping from old→new item IDs
-  // so we can remap itemImages keys correctly
+  // Map old item IDs → new item IDs so itemImages keys stay consistent
   const itemIdMap={};
   copy.items=(copy.items||[]).map(function(it){
     const newItemId=uid();
@@ -12187,61 +12278,48 @@ async function duplicateToGroup(quotId,groupId,newGrcType){
     return Object.assign({},c,{id:uid()});
   });
 
-  // ── Copy images from _imageMap using old quotId keys → new quotId keys ──
-  // sitePhotos: {srcId}__photo__0, __photo__1, ...
-  // itemImages: {srcId}__item__{oldItemId}
-  const newSitePhotos=[];
+  // ── Use sitePhotos/itemImages already in the JSON copy (populated by _restoreQuotImages) ──
+  // This is more reliable than reading _imageMap which may not be fully loaded
+  const newSitePhotos=Array.isArray(copy.sitePhotos)?copy.sitePhotos.slice():[];
+  
+  // Remap itemImages keys from old item IDs to new item IDs
   const newItemImages={};
+  const srcItemImages=copy.itemImages||{};
+  Object.keys(srcItemImages).forEach(function(oldItemId){
+    const newItemId=itemIdMap[oldItemId]||oldItemId;
+    newItemImages[newItemId]=srcItemImages[oldItemId];
+  });
+  copy.itemImages=newItemImages;
 
-  // Copy site photos — iterate _imageMap for this source quotation
-  var photoIdx=0;
-  while(true){
-    const oldKey=quotId+'__photo__'+photoIdx;
-    const imgData=_imageMap[oldKey];
-    if(!imgData)break; // no more photos
-    const newKey=newId+'__photo__'+photoIdx;
-    _imageMap[newKey]=imgData; // copy in memory
-    newSitePhotos.push(imgData);
-    photoIdx++;
-  }
-
-  // Copy item images — remap old item IDs to new item IDs
-  Object.keys(_imageMap).forEach(function(key){
-    const prefix=quotId+'__item__';
-    if(key.indexOf(prefix)===0){
-      const oldItemId=key.slice(prefix.length);
-      const newItemId=itemIdMap[oldItemId]||oldItemId; // use mapped ID or keep original
-      const newKey=newId+'__item__'+newItemId;
-      _imageMap[newKey]=_imageMap[key];
-      newItemImages[newItemId]=_imageMap[key];
-    }
+  // Also populate _imageMap in memory so the duplicate renders immediately
+  newSitePhotos.forEach(function(imgData,i){
+    if(imgData) _imageMap[newId+'__photo__'+i]=imgData;
+  });
+  Object.keys(newItemImages).forEach(function(itemId){
+    if(newItemImages[itemId]) _imageMap[newId+'__item__'+itemId]=newItemImages[itemId];
   });
 
-  // Update copy's sitePhotos and itemImages to reflect the duplicated data
-  if(newSitePhotos.length>0) copy.sitePhotos=newSitePhotos;
-  if(Object.keys(newItemImages).length>0) copy.itemImages=newItemImages;
-
-  // Write quotation to storage (without images — they're in _imageMap)
+  // Write to storage
   const freshQuots=ls('quotations')||[];
   freshQuots.push(copy);
   ss('quotations',freshQuots);
 
-  // Save images to Firebase under the new quotation ID
-  if(_fsReady&&_db&&(newSitePhotos.length>0||Object.keys(newItemImages).length>0)){
+  // Persist images to Firebase under the new quotation ID
+  if((newSitePhotos.length>0||Object.keys(newItemImages).length>0)){
     try{
       await _saveQuotImages(newId, newSitePhotos, newItemImages);
-      console.log('[Duplicate] Images copied to Firebase for new quotation '+newId);
     }catch(e){
-      console.warn('[Duplicate] Image save to Firebase failed (they are still in memory):', e.message);
+      console.warn('[Duplicate] Image Firebase save failed (in memory still):', e.message);
     }
   }
 
   const photoCount=newSitePhotos.length;
   const itemImgCount=Object.keys(newItemImages).length;
-  const imgMsg=( photoCount||itemImgCount)?' ('+( photoCount?' '+photoCount+' site photo'+(photoCount>1?'s':''):'')+( itemImgCount?' '+itemImgCount+' item image'+(itemImgCount>1?'s':''):'')+' copied)':'';
+  const imgMsg=(photoCount||itemImgCount)
+    ?' ('+( photoCount?photoCount+' photo'+(photoCount>1?'s':''):'')
+      +(photoCount&&itemImgCount?', ':'')+( itemImgCount?itemImgCount+' item image'+(itemImgCount>1?'s':''):'')
+    +' copied)':'';
   toast('✅ Duplicated as "'+( newGrcType||copy.grcType)+'"'+imgMsg+'!','success');
-
-  // Re-open group popup so user can see the new duplicate
   setTimeout(function(){openGroupPopupFromQuot(groupId,newId);},200);
 }
 function addNewQuotToGroup(groupId){
@@ -13067,15 +13145,32 @@ async function importDataJSON(file){
 }
 
 function init(){
+  _initFirebase(); // Safe: scripts are loaded by the time init() runs
   setupGlobalPasteListener();
   initData();initRewardsData();initFormulasData();initRateWarnings();initClientFields();loadTheme();
   const ct=ls('chatTheme');if(ct&&ct.accent)document.documentElement.style.setProperty('--accent',ct.accent);
   document.getElementById('topbarDate').textContent=new Date().toLocaleDateString('en-IN',{weekday:'long',day:'numeric',month:'long',year:'numeric'});
   // Restore sidebar collapsed state
   if(ls('sidebarCollapsed')===true) document.body.classList.add('sidebar-collapsed');
-  const users=ls('users')||[];const admin=users.find(u=>u.role==='admin')||users[0];
-  if(admin)setCurrentUser(admin);
-  loadSettings();renderDashboard();
+
+  const users=ls('users')||[];
+  // Only auto-login if there is exactly ONE user (single-user/dev mode)
+  // With multiple users, ALWAYS show login modal first — never show admin page by default
+  if(users.length===1){
+    const onlyUser=users[0];
+    setCurrentUser(onlyUser);
+    loadSettings();renderDashboard();
+  } else {
+    // Multi-user: set a minimal admin context for rendering but show login immediately
+    // Use first admin for nav/theme setup but keep main page hidden behind login
+    const admin=users.find(u=>u.role==='admin')||users[0];
+    if(admin) setCurrentUser(admin);
+    loadSettings();
+    // Show login modal immediately — don't delay, don't let anyone use admin view
+    showLoginModal();
+    return; // Don't render dashboard until login
+  }
+
   if(ls('sheetURL'))setTimeout(()=>fetchSheetData(false),2500);
   // Add sample lead if leads empty
   if(!(ls('leads')||[]).length){
@@ -13090,7 +13185,6 @@ function init(){
     }]);
   }
   setInterval(()=>{updateBadge();updateApprovalBadge();},60000);
-  setTimeout(showLoginModal,350);
 }
 // Load Firestore data first, then start the app + real-time listeners
 loadFromFirestore().then(function(){
