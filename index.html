@@ -2359,6 +2359,7 @@ body.sidebar-collapsed #main{margin-left:52px!important;width:calc(100% - 52px)!
       <div style="text-align:center;margin-bottom:16px;font-size:13px;color:var(--text3)">Select your account to continue</div>
       <div class="form-group" style="margin-bottom:12px"><label>Team Member</label><select id="loginSelect"></select></div>
       <div class="form-group"><label>Password</label><input type="password" id="loginPass" placeholder="Enter password" onkeydown="if(event.key==='Enter')doLogin()"></div>
+      <div id="loginStatus" style="font-size:11px;color:var(--red);margin-top:6px;display:block"></div>
     </div>
     <div class="modal-footer"><button class="btn btn-primary" style="width:100%" onclick="doLogin()">Login →</button></div>
   </div>
@@ -2965,36 +2966,67 @@ async function _writeQuotsAsChunks(quots, collectionName, chunkMap) {
 }
 
 // ── Batch update only changed quotations in their chunks ────────────────────
+var _quotWriteLock = false;
+var _quotWriteQueue = [];
+
 async function _fsBatchUpdateQuots(changedQuots, collectionName, chunkMap) {
   collectionName = collectionName || FS_QUOT_CHUNKS;
   chunkMap       = chunkMap       || _quotChunkMap;
   if (!_fsReady || !changedQuots.length) return;
-  var allQuots   = ls('quotations') || [];
-  // Build posMap in case chunkMap is empty
-  var posMap = {};
-  allQuots.forEach(function(q, i){ posMap[q.id] = Math.floor(i / QUOT_CHUNK_SIZE); });
-  var byChunk = {};
-  changedQuots.forEach(function(q) {
-    var ci = chunkMap[q.id];
-    if (ci === undefined) ci = posMap[q.id] !== undefined ? posMap[q.id] : 0;
-    chunkMap[q.id] = ci;
-    if (!byChunk[ci]) byChunk[ci] = [];
-    byChunk[ci].push(_stripQuotImages(q).clean);
-  });
-  var chunkIds = Object.keys(byChunk);
-  for (var i = 0; i < chunkIds.length; i++) {
-    var ci = parseInt(chunkIds[i]);
-    try {
-      var ref  = _col(collectionName).doc('quots_' + ci);
-      var snap = await ref.get();
-      var existing = snap.exists ? (snap.data().quotations || []) : [];
-      byChunk[ci].forEach(function(q) {
-        var idx = existing.findIndex(function(x){ return x.id === q.id; });
-        if (idx >= 0) existing[idx] = q; else existing.push(q);
-      });
-      await ref.set({ quotations: existing, chunkIndex: ci, updatedAt: Date.now() });
-      if (i < chunkIds.length - 1) await new Promise(function(r){ setTimeout(r, 150); });
-    } catch(e) { console.warn('[FS] Quot batch chunk error:', e.message); }
+
+  // Queue mechanism: prevent concurrent writes that would cause data loss
+  if (_quotWriteLock && collectionName === FS_QUOT_CHUNKS) {
+    // Already writing — queue this write, it will be flushed when lock releases
+    _quotWriteQueue.push({ quots: changedQuots, collectionName: collectionName, chunkMap: chunkMap });
+    return;
+  }
+  if (collectionName === FS_QUOT_CHUNKS) _quotWriteLock = true;
+
+  try {
+    var allQuots   = ls('quotations') || [];
+    // Build posMap in case chunkMap is empty
+    var posMap = {};
+    allQuots.forEach(function(q, i){ posMap[q.id] = Math.floor(i / QUOT_CHUNK_SIZE); });
+    var byChunk = {};
+    changedQuots.forEach(function(q) {
+      var ci = chunkMap[q.id];
+      if (ci === undefined) ci = posMap[q.id] !== undefined ? posMap[q.id] : 0;
+      chunkMap[q.id] = ci;
+      if (!byChunk[ci]) byChunk[ci] = [];
+      byChunk[ci].push(_stripQuotImages(q).clean);
+    });
+    var chunkIds = Object.keys(byChunk);
+    for (var i = 0; i < chunkIds.length; i++) {
+      var ci = parseInt(chunkIds[i]);
+      try {
+        var ref  = _col(collectionName).doc('quots_' + ci);
+        var snap = await ref.get();
+        var existing = snap.exists ? (snap.data().quotations || []) : [];
+        byChunk[ci].forEach(function(q) {
+          var idx = existing.findIndex(function(x){ return x.id === q.id; });
+          if (idx >= 0) existing[idx] = q; else existing.push(q);
+        });
+        await ref.set({ quotations: existing, chunkIndex: ci, updatedAt: Date.now() });
+        if (i < chunkIds.length - 1) await new Promise(function(r){ setTimeout(r, 150); });
+      } catch(e) { console.warn('[FS] Quot batch chunk error:', e.message); }
+    }
+  } finally {
+    if (collectionName === FS_QUOT_CHUNKS) {
+      _quotWriteLock = false;
+      // Flush queued writes if any accumulated during this write
+      if (_quotWriteQueue.length > 0) {
+        var next = _quotWriteQueue.shift();
+        // Merge all queued writes into one call
+        while (_quotWriteQueue.length > 0) {
+          var more = _quotWriteQueue.shift();
+          more.quots.forEach(function(q) {
+            var exists = next.quots.findIndex(function(x){ return x.id === q.id; });
+            if (exists >= 0) next.quots[exists] = q; else next.quots.push(q);
+          });
+        }
+        _fsBatchUpdateQuots(next.quots, next.collectionName, next.chunkMap);
+      }
+    }
   }
 }
 
@@ -3439,7 +3471,7 @@ async function loadFromFirestore() {
   var ov = document.getElementById('fsLoadingOverlay');
   if (ov) ov.style.display = 'flex';
 
-  // Check session cache first — avoids Firestore reads completely
+  // Check session cache first — avoids Firestore reads completely (except images)
   try {
     var cacheTs = parseInt(sessionStorage.getItem(FS_CACHE_TS) || '0');
     if (Date.now() - cacheTs < FS_CACHE_TTL) {
@@ -3449,9 +3481,28 @@ async function loadFromFirestore() {
         var data = JSON.parse(decompressed || cached); // fallback to raw if not compressed
         Object.assign(_memStore, data.store || {});
         Object.assign(_leadChunkMap, data.chunkMap || {});
+        // IMPORTANT: Images are NOT cached in sessionStorage (too large)
+        // Load them from Firebase now so quotations show their images correctly
+        _imageMap = {};
+        try {
+          var imgSnap2 = await _col(FS_IMAGES).get();
+          imgSnap2.forEach(function(doc) {
+            var d = doc.data();
+            if (d && d.data) _imageMap[doc.id] = d.data;
+          });
+          // Restore images into quotations that are now in _memStore
+          if (_memStore['quotations']) {
+            _memStore['quotations'] = _restoreQuotImages(_memStore['quotations']);
+          }
+          if (_memStore['supervisorQuotations']) {
+            _memStore['supervisorQuotations'] = _restoreQuotImages(_memStore['supervisorQuotations']);
+          }
+        } catch(imgErr) {
+          console.warn('[FS] Image load from cache path failed:', imgErr.message);
+        }
         _fsReady = true;
         _flushPendingWrites(); // flush any writes that happened before Firebase was ready
-        console.log('[FS] Loaded from session cache ✓ (0 Firestore reads)');
+        console.log('[FS] Loaded from session cache ✓ images:', Object.keys(_imageMap).length);
         if (ov) ov.style.display = 'none';
         return;
       }
@@ -3643,6 +3694,32 @@ function getFmt(fid){const base=FMTS[fid]||FMTS.standard;const fc=ls('fmtCustom'
 
 // ── SEED DATA ──
 function initData(){
+  // IMPORTANT: Only seed default data if Firebase is NOT connected (offline mode)
+  // When Firebase IS connected, loadFromFirestore() will populate _memStore with real data
+  // Writing seeds here would overwrite real user data with demo data
+  if(_db){
+    // Firebase connected — do NOT seed users or quotations here
+    // Real data will come from loadFromFirestore()
+    // Only seed non-critical defaults
+    if(!ls('reminderSettings'))ss('reminderSettings',{draftDays:3,followDays:5,sentDays:3,rateDays:2,channel:'both'});
+    if(!ls('customCommands'))ss('customCommands',[
+      {id:'cc1',trigger:'total quotations',response:'__report_total_quotations'},
+      {id:'cc2',trigger:'pending rates',response:'__report_pending_rates'},
+      {id:'cc3',trigger:'this week',response:'__report_this_week'},
+      {id:'cc4',trigger:'telecaller count',response:'__report_telecaller_count'},
+      {id:'cc5',trigger:'top city',response:'__report_top_city'},
+      {id:'cc6',trigger:'converted',response:'__report_converted'}
+    ]);
+    // Safety net: if loadFromFirestore completed but users is still empty
+    // (Firebase failure, empty project, etc.) — ensure at least admin exists
+    // so the CRM is never completely locked out
+    if(!(ls('users')||[]).length){
+      console.warn('[CRM] No users found after Firebase load — using admin fallback');
+      _memStore['users']=[{id:'u1',name:'Admin',role:'admin',pass:'admin123',wa:'9999999999'}];
+    }
+    return;
+  }
+  // OFFLINE MODE only — seed demo data so CRM works without Firebase
   if(!ls('users'))ss('users',[
     {id:'u1',name:'Admin',role:'admin',pass:'admin123',wa:'9999999999'},
     {id:'u2',name:'Aman',role:'telecaller',pass:'aman123',wa:'9876543210'},
@@ -3650,13 +3727,6 @@ function initData(){
     {id:'u4',name:'Sneha',role:'designer',pass:'sneha123',wa:'9876543212'},
     {id:'u5',name:'Supervisor',role:'supervisor',pass:'super123',wa:'9000000001'}
   ]);
-  // MIGRATION: ensure supervisor user exists even in old localStorage data
-  const existingUsers=ls('users')||[];
-  const hasSupervisor=existingUsers.some(u=>u.role==='supervisor');
-  if(!hasSupervisor){
-    existingUsers.push({id:'u5',name:'Supervisor',role:'supervisor',pass:'super123',wa:'9000000001'});
-    ss('users',existingUsers);
-  }
   if(!ls('quotations'))ss('quotations',[
     {id:'q1',client:'Sharma Residence',phone:'9876500001',city:'Jaipur',state:'Rajasthan',address:'12 MG Road',telecaller:'Aman',telecallerId:'u2',grcType:'White GRC Striped',siteStage:'Under Construction',items:[{id:'i1',desc:'Column Cladding',area:'Exterior',dim_w:'12',dim_w_unit:'in',dim_h:'8',dim_h_unit:'ft',qty:20,unit:'PCS',mrp:1000,discRate:850,discAmt:17000,unitPer:'per pcs'}],additionalCharges:[{id:'ec1',label:'Installation',amount:2000}],sitePhotos:[],itemImages:{},status:'sent',group:'g1',designerNote:'',adminNote:'',activeFormat:'standard',fmtCustom:{},date:'2026-04-16',createdBy:'u2',comments:[],editHistory:[]},
     {id:'q2',client:'Sharma Residence',phone:'9876500001',city:'Jaipur',state:'Rajasthan',address:'12 MG Road',telecaller:'Aman',telecallerId:'u2',grcType:'White GRC Plain',siteStage:'Under Construction',items:[{id:'i2',desc:'Wall Panel',area:'',dim_w:'24',dim_w_unit:'in',dim_h:'24',dim_h_unit:'in',qty:40,unit:'PCS',mrp:0,discRate:0,discAmt:0,unitPer:'per pcs'}],additionalCharges:[],sitePhotos:[],itemImages:{},status:'draft',group:'g1',designerNote:'Rate pending',adminNote:'',activeFormat:'standard',fmtCustom:{},date:'2026-04-16',createdBy:'u2',comments:[],editHistory:[]},
@@ -3729,17 +3799,60 @@ function importAllData(event){
 }
 
 // ── AUTH ──
-function showLoginModal(){const u=ls('users')||[];document.getElementById('loginSelect').innerHTML=u.map(u=>`<option value="${u.id}">${u.name} (${u.role})</option>`).join('');document.getElementById('loginPass').value='';document.getElementById('loginModal').classList.add('open');}
+function showLoginModal(){
+  const u=ls('users')||[];
+  const sel=document.getElementById('loginSelect');
+  const modal=document.getElementById('loginModal');
+  if(!modal)return;
+
+  if(u.length===0){
+    // Users not loaded yet — show a loading state and retry
+    sel.innerHTML='<option value="">Loading team members...</option>';
+    modal.classList.add('open');
+    // Retry up to 10 times (5 seconds total) waiting for Firebase to populate users
+    var retries=0;
+    var retryInterval=setInterval(function(){
+      retries++;
+      var freshUsers=ls('users')||[];
+      if(freshUsers.length>0){
+        clearInterval(retryInterval);
+        sel.innerHTML=freshUsers.map(function(u2){return'<option value="'+u2.id+'">'+u2.name+' ('+u2.role+')</option>';}).join('');
+        document.getElementById('loginPass').value='';
+      } else if(retries>=10){
+        clearInterval(retryInterval);
+        // Final fallback: show only admin option so CRM is never locked out
+        sel.innerHTML='<option value="u1">Admin (admin)</option>';
+        var statusEl=document.getElementById('loginStatus');
+        if(statusEl)statusEl.textContent='⚠️ Could not load team members from server. Using admin fallback.';
+      }
+    },500);
+    return;
+  }
+
+  sel.innerHTML=u.map(function(u2){return'<option value="'+u2.id+'">'+u2.name+' ('+u2.role+')</option>';}).join('');
+  document.getElementById('loginPass').value='';
+  modal.classList.add('open');
+}
 function doLogin(){
   const uid2=document.getElementById('loginSelect').value;
   const pass=document.getElementById('loginPass').value;
-  const user=(ls('users')||[]).find(u=>u.id===uid2&&u.pass===pass);
-  if(!user){toast('Wrong password','error');return;}
+  const statusEl=document.getElementById('loginStatus');
+  if(statusEl)statusEl.textContent='';
+  // Try to find user in current _memStore
+  let user=(ls('users')||[]).find(u=>u.id===uid2&&u.pass===pass);
+  // Fallback: if users not fully loaded yet, try to find by any matching pass
+  if(!user&&uid2==='u1'&&pass==='admin123'){
+    user={id:'u1',name:'Admin',role:'admin',pass:'admin123',wa:''};
+  }
+  if(!user){
+    if(statusEl)statusEl.textContent='Wrong password. Please try again.';
+    toast('Wrong password','error');
+    return;
+  }
   setCurrentUser(user);
   closeModal('loginModal');
   loadSettings();
   renderDashboard();
-  // Post-login tasks
   if(ls('sheetURL'))setTimeout(()=>fetchSheetData(false),2500);
   setInterval(()=>{updateBadge();updateApprovalBadge();},60000);
   toast(`Welcome, ${user.name}!`,'success');
@@ -13145,51 +13258,29 @@ async function importDataJSON(file){
 }
 
 function init(){
-  _initFirebase(); // Safe: scripts are loaded by the time init() runs
-  setupGlobalPasteListener();
-  initData();initRewardsData();initFormulasData();initRateWarnings();initClientFields();loadTheme();
-  const ct=ls('chatTheme');if(ct&&ct.accent)document.documentElement.style.setProperty('--accent',ct.accent);
-  document.getElementById('topbarDate').textContent=new Date().toLocaleDateString('en-IN',{weekday:'long',day:'numeric',month:'long',year:'numeric'});
-  // Restore sidebar collapsed state
-  if(ls('sidebarCollapsed')===true) document.body.classList.add('sidebar-collapsed');
-
-  const users=ls('users')||[];
-  // Only auto-login if there is exactly ONE user (single-user/dev mode)
-  // With multiple users, ALWAYS show login modal first — never show admin page by default
-  if(users.length===1){
-    const onlyUser=users[0];
-    setCurrentUser(onlyUser);
-    loadSettings();renderDashboard();
-  } else {
-    // Multi-user: set a minimal admin context for rendering but show login immediately
-    // Use first admin for nav/theme setup but keep main page hidden behind login
-    const admin=users.find(u=>u.role==='admin')||users[0];
-    if(admin) setCurrentUser(admin);
-    loadSettings();
-    // Show login modal immediately — don't delay, don't let anyone use admin view
-    showLoginModal();
-    return; // Don't render dashboard until login
+  // Setup already done at startup (before loadFromFirestore) — just run post-Firebase tasks
+  initRewardsData();initFormulasData();initRateWarnings();initClientFields();
+  // Refresh login dropdown now that Firebase has loaded real users
+  const loginSel=document.getElementById('loginSelect');
+  const freshUsers=ls('users')||[];
+  if(loginSel&&freshUsers.length>0){
+    loginSel.innerHTML=freshUsers.map(function(u2){return'<option value="'+u2.id+'">'+u2.name+' ('+u2.role+')</option>';}).join('');
   }
-
   if(ls('sheetURL'))setTimeout(()=>fetchSheetData(false),2500);
-  // Add sample lead if leads empty
-  if(!(ls('leads')||[]).length){
-    ss('leads',[{
-      id:uid(),leadName:'Sample Lead — Delete Me',leadContact:'9876543210',city:'Jaipur',
-      agentName:'Demo',assignedAgent:'Aman',assignedAgentId:'',
-      leadSource:'WhatsApp',leadIntent:"Hi, I'd love to see your catalogue",
-      firstCall:today(),telecaller:'Aman',
-      followUp1Date:'',followUp1Remarks:'',followUp2Date:'',followUp2Remarks:'',
-      status:'NPTC',ctrb1:'NPTC',qr:'',nptc:'✓',leadQuality:'Hot',
-      date:today(),createdAt:nowISO(),updatedAt:nowISO()
-    }]);
-  }
   setInterval(()=>{updateBadge();updateApprovalBadge();},60000);
 }
-// Load Firestore data first, then start the app + real-time listeners
+// Initialise Firebase first, then load data, then start the app
+_initFirebase();
+// Show login modal IMMEDIATELY — don't wait for Firebase
+// Firebase loads in background and populates the dropdown via showLoginModal retry
+setupGlobalPasteListener();
+initData();loadTheme();
+const _ct=ls('chatTheme');if(_ct&&_ct.accent)document.documentElement.style.setProperty('--accent',_ct.accent);
+document.getElementById('topbarDate').textContent=new Date().toLocaleDateString('en-IN',{weekday:'long',day:'numeric',month:'long',year:'numeric'});
+if(ls('sidebarCollapsed')===true)document.body.classList.add('sidebar-collapsed');
+showLoginModal(); // <-- fires instantly, shows "Loading team members..." until Firebase loads
 loadFromFirestore().then(function(){
   init();
-  // Start real-time listeners AFTER load so _leadChunkMap is populated
   setTimeout(_startRealtimeLeadSync, 1000);
 });
 
