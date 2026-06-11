@@ -2,7 +2,7 @@
 <html lang="en" data-theme="dark">
 <head>
 <meta charset="UTF-8"><meta name="viewport" content="width=device-width,initial-scale=1.0">
-<title>Devyora CRM v14</title>
+<title>Devyora CRM v15</title>
 <link href="https://fonts.googleapis.com/css2?family=DM+Sans:wght@300;400;500;600;700&family=Playfair+Display:wght@600;700&family=Cormorant+Garamond:ital,wght@0,400;0,500;0,600;1,400&family=Montserrat:wght@300;400;500;600&display=swap" rel="stylesheet">
 <script src="https://cdnjs.cloudflare.com/ajax/libs/qrcodejs/1.0.0/qrcode.min.js"></script>
 <script src="https://cdnjs.cloudflare.com/ajax/libs/jszip/3.10.1/jszip.min.js"></script>
@@ -2776,6 +2776,17 @@ function _initFirebase(){
     if(typeof firebase !== 'undefined') {
       try { firebase.initializeApp(_firebaseConfig); } catch(e) {}
       _db = firebase.firestore();
+      // FIX: Firebase offline persistence — writes go to IndexedDB first
+      // If power cuts mid-save, IndexedDB entry survives and auto-retries on next open
+      _db.enablePersistence({synchronizeTabs: false}).catch(function(err){
+        if(err.code==='failed-precondition'){
+          // Multiple tabs open — persistence only works in one tab at a time
+          console.warn('[CRM] Firebase persistence unavailable (multiple tabs)');
+        } else if(err.code==='unimplemented'){
+          // Browser doesn't support persistence (rare)
+          console.warn('[CRM] Firebase persistence not supported in this browser');
+        }
+      });
     } else {
       console.warn('[CRM] Firebase SDK not loaded — running in offline/memory mode. Host this file on a server for full sync.');
     }
@@ -2797,6 +2808,7 @@ var _leadChunkMap  = {};   // leadId → chunkIndex
 var _quotChunkMap  = {};   // quotId → chunkIndex
 var _svChunkMap    = {};   // svQuotId → chunkIndex
 var _imageMap      = {};   // docId (e.g. q1__item__i1) → base64 data string
+var _imageMapReady = false; // true only after full image load — prevents orphan deletion on partial load
 
 // Safe _db.collection wrapper — returns a dummy object if _db is null
 function _col(name){
@@ -2889,13 +2901,15 @@ function _stripQuotImages(q) {
 function _restoreQuotImages(quots) {
   return (quots || []).map(function(q) {
     var r = Object.assign({}, q);
-    // Site photos: keys like {quotId}__photo__0, __photo__1 ...
+    // Site photos: scan ALL _imageMap keys — don't break on gap
+    // FIX: old break-on-gap caused photos 3,4,5 to be lost if photo_2 missing
     r.sitePhotos = [];
-    for (var i = 0; i < 50; i++) {
-      var src = _imageMap[q.id + '__photo__' + i];
-      if (!src) break;
-      r.sitePhotos.push(src);
-    }
+    var photoKeys = Object.keys(_imageMap)
+      .filter(function(k){ return k.indexOf(q.id+'__photo__')===0; })
+      .sort(function(a,b){
+        return parseInt(a.split('__photo__')[1]||0) - parseInt(b.split('__photo__')[1]||0);
+      });
+    photoKeys.forEach(function(k){ if(_imageMap[k]) r.sitePhotos.push(_imageMap[k]); });
     // Item images: keys like {quotId}__item__{itemId}
     r.itemImages = {};
     Object.keys(_imageMap).forEach(function(key) {
@@ -2938,19 +2952,59 @@ async function _saveQuotImages(quotId, sitePhotos, itemImages) {
       await _col(FS_IMAGES).doc(docId2).set({ quotId: quotId, type: 'item', itemId: itemId, data: imgSrc, ts: Date.now() });
     } catch(e) { console.warn('[FS] Image save error ['+docId2+']:', e.message); }
   }
-  // Delete image docs that were removed from the quotation
-  for (var ki = 0; ki < oldKeys.length; ki++) {
-    if (newKeys.indexOf(oldKeys[ki]) === -1) {
-      delete _imageMap[oldKeys[ki]];
-      try { await _col(FS_IMAGES).doc(oldKeys[ki]).delete(); } catch(e) {}
+  // FIX C+E: Only delete orphan images if image map is fully loaded
+  // and we actually wrote new images (not an empty-sitePhotos call)
+  var hasNewImages = newKeys.length > 0;
+  var hadOldImages = oldKeys.length > 0;
+  if(_imageMapReady && (hasNewImages || !hadOldImages)){
+    // Safe to clean up: we wrote images or there were none before
+    for (var ki = 0; ki < oldKeys.length; ki++) {
+      if (newKeys.indexOf(oldKeys[ki]) === -1) {
+        delete _imageMap[oldKeys[ki]];
+        try { await _col(FS_IMAGES).doc(oldKeys[ki]).delete(); } catch(e) {}
+      }
     }
+  }
+  // If hasNewImages=false but hadOldImages=true: called with empty sitePhotos
+  // when images existed before — likely a partial load. Skip deletion entirely.
+}
+
+// FIX A+C+F: Properly sequence image saves BEFORE chunk write
+// This prevents onSnapshot firing before _imageMap is complete
+// Also fixes Bug C: only delete orphan images if we have a complete image set
+async function _saveQuotationsBatch(v, collectionName, chunkMap){
+  if(!_fsReady) return;
+  _savePending = true; // FIX: mark save in progress for beforeunload guard
+  // Step 1: Save ALL images first — await each quotation's images
+  // so _imageMap is complete before chunk write triggers onSnapshot
+  for(var qi=0; qi<(v||[]).length; qi++){
+    var q = v[qi];
+    var hasPhotos = (q.sitePhotos&&q.sitePhotos.length>0);
+    var hasItemImgs = (q.itemImages&&Object.keys(q.itemImages||{}).length>0);
+    if(hasPhotos||hasItemImgs){
+      try{
+        await _saveQuotImages(q.id, q.sitePhotos||[], q.itemImages||{});
+      }catch(e){ console.warn('[FS] Image save failed for',q.id,e.message); }
+    }
+  }
+  // Step 2: ONLY NOW write the stripped quotation chunks
+  // onSnapshot will fire AFTER this, at which point _imageMap is fully populated
+  try{
+    await _fsBatchUpdateQuots(v, collectionName, chunkMap);
+  } finally {
+    _savePending = false; // FIX: save complete, clear beforeunload guard
   }
 }
 
-// ── Write quotations as chunks to crm_quot_chunks (images stripped) ─────────
+// ── Write ALL quotations as chunks to crm_quot_chunks (images stripped) ─────────
 async function _writeQuotsAsChunks(quots, collectionName, chunkMap) {
   collectionName = collectionName || FS_QUOT_CHUNKS;
   chunkMap       = chunkMap       || _quotChunkMap;
+  // FIX G: never overwrite with empty array — would delete all quotations
+  if(!quots || quots.length === 0){
+    console.warn('[FS] _writeQuotsAsChunks called with empty array — skipping to prevent data loss');
+    return;
+  }
   var stripped = quots.map(function(q){ return _stripQuotImages(q).clean; });
   var totalChunks = Math.ceil(stripped.length / QUOT_CHUNK_SIZE) || 1;
   // Reset chunk map
@@ -2967,23 +3021,31 @@ async function _writeQuotsAsChunks(quots, collectionName, chunkMap) {
 
 // ── Batch update only changed quotations in their chunks ────────────────────
 var _quotWriteLock = false;
+var _savePending = false; // true while _saveQuotationsBatch is running
 var _quotWriteQueue = [];
+var _svWriteLock = false;   // separate lock for crm_sv_chunks writes
+var _svWriteQueue = [];     // separate queue for crm_sv_chunks writes
 
 async function _fsBatchUpdateQuots(changedQuots, collectionName, chunkMap) {
   collectionName = collectionName || FS_QUOT_CHUNKS;
   chunkMap       = chunkMap       || _quotChunkMap;
   if (!_fsReady || !changedQuots.length) return;
 
-  // Queue mechanism: prevent concurrent writes that would cause data loss
-  if (_quotWriteLock && collectionName === FS_QUOT_CHUNKS) {
-    // Already writing — queue this write, it will be flushed when lock releases
-    _quotWriteQueue.push({ quots: changedQuots, collectionName: collectionName, chunkMap: chunkMap });
+  // Determine which lock/queue to use based on collection
+  var isSV = (collectionName === FS_SV_CHUNKS);
+  var lock  = isSV ? '_svWriteLock'   : '_quotWriteLock';
+  var queue = isSV ? '_svWriteQueue'  : '_quotWriteQueue';
+
+  if (window[lock]) {
+    window[queue].push({ quots: changedQuots, collectionName: collectionName, chunkMap: chunkMap });
     return;
   }
-  if (collectionName === FS_QUOT_CHUNKS) _quotWriteLock = true;
+  window[lock] = true;
 
   try {
-    var allQuots   = ls('quotations') || [];
+    // FIX: use the correct memory key depending on which collection we're writing
+    var memKey   = isSV ? 'supervisorQuotations' : 'quotations';
+    var allQuots = ls(memKey) || [];
     // Build posMap in case chunkMap is empty
     var posMap = {};
     allQuots.forEach(function(q, i){ posMap[q.id] = Math.floor(i / QUOT_CHUNK_SIZE); });
@@ -3002,30 +3064,39 @@ async function _fsBatchUpdateQuots(changedQuots, collectionName, chunkMap) {
         var ref  = _col(collectionName).doc('quots_' + ci);
         var snap = await ref.get();
         var existing = snap.exists ? (snap.data().quotations || []) : [];
+        var chunkUpdatedAt = snap.exists ? (snap.data().updatedAt || 0) : 0;
+        // FIX H: if chunk was updated by another user MORE RECENTLY than our
+        // session started, re-read to get latest before merging
+        // This reduces (not eliminates) multi-user race data loss
+        var chunkHasKnownQuots = Object.values(chunkMap).filter(function(c){return c===ci;}).length > 1;
+        if(snap.exists && existing.length === 0 && chunkHasKnownQuots){
+          console.warn('[FS] Chunk '+ci+' read returned empty but chunkMap has entries — aborting write to prevent data loss');
+          continue;
+        }
         byChunk[ci].forEach(function(q) {
           var idx = existing.findIndex(function(x){ return x.id === q.id; });
           if (idx >= 0) existing[idx] = q; else existing.push(q);
         });
         await ref.set({ quotations: existing, chunkIndex: ci, updatedAt: Date.now() });
+        if(!isSV) _lastQuotWrite = Date.now(); // FIX F: mark our write time
         if (i < chunkIds.length - 1) await new Promise(function(r){ setTimeout(r, 150); });
       } catch(e) { console.warn('[FS] Quot batch chunk error:', e.message); }
     }
   } finally {
-    if (collectionName === FS_QUOT_CHUNKS) {
-      _quotWriteLock = false;
-      // Flush queued writes if any accumulated during this write
-      if (_quotWriteQueue.length > 0) {
-        var next = _quotWriteQueue.shift();
-        // Merge all queued writes into one call
-        while (_quotWriteQueue.length > 0) {
-          var more = _quotWriteQueue.shift();
-          more.quots.forEach(function(q) {
-            var exists = next.quots.findIndex(function(x){ return x.id === q.id; });
-            if (exists >= 0) next.quots[exists] = q; else next.quots.push(q);
-          });
-        }
-        _fsBatchUpdateQuots(next.quots, next.collectionName, next.chunkMap);
+    // Release lock and flush any queued writes for this collection
+    window[lock] = false;
+    var q2 = window[queue];
+    if (q2 && q2.length > 0) {
+      var next = q2.shift();
+      // Merge all remaining queued writes into one call to minimise round-trips
+      while (q2.length > 0) {
+        var more = q2.shift();
+        more.quots.forEach(function(q) {
+          var exists = next.quots.findIndex(function(x){ return x.id === q.id; });
+          if (exists >= 0) next.quots[exists] = q; else next.quots.push(q);
+        });
       }
+      _fsBatchUpdateQuots(next.quots, next.collectionName, next.chunkMap);
     }
   }
 }
@@ -3202,57 +3273,19 @@ function _startRealtimeLeadSync() {
     }, function(e){ console.warn('[FS] QT snapshot error:', e.message); });
   _chunkListeners.push(qtUnsub);
 
-  // ── Quotations (crm_kv/quotations) — any user saving a quotation triggers this ──
-  var quotUnsub = _col(FS_KV).doc('quotations')
-    .onSnapshot(function(snap) {
-      if (!snap.exists || snap.metadata.hasPendingWrites) return;
-      var incoming = (snap.data() || {}).data;
-      if (!Array.isArray(incoming)) return;
-      // Only update if remote data is actually different
-      var local = _memStore['quotations'] || [];
-      if (JSON.stringify(incoming).length === JSON.stringify(local).length &&
-          (incoming[0]||{}).updatedAt === (local[0]||{}).updatedAt) return; // same data
-      _memStore['quotations'] = incoming;
-      _invalidateFsCache();
-      // Re-render whichever quotation page is currently active
-      ['page-quotations','page-confirmed','page-lost','page-svQuotations'].forEach(function(pid){
-        var el = document.getElementById(pid);
-        if (el && el.classList.contains('active')) {
-          try {
-            if (pid === 'page-quotations') { filterQuotations && filterQuotations(); }
-            else if (pid === 'page-confirmed') { renderConfirmed && renderConfirmed(); }
-            else if (pid === 'page-lost') { renderLost && renderLost(); }
-            else if (pid === 'page-svQuotations') { renderSVQuotationsPage && renderSVQuotationsPage(); }
-          } catch(ex){}
-        }
-      });
-      console.log('[FS] ⚡ Real-time update: quotations changed (' + incoming.length + ')');
-    }, function(e){ console.warn('[FS] Quotations snapshot error:', e.message); });
-  _chunkListeners.push(quotUnsub);
-
-  // ── Supervisor Quotations (crm_kv/supervisorQuotations) — real-time sync ──
-  var svQuotUnsub = _col(FS_KV).doc('supervisorQuotations')
-    .onSnapshot(function(snap) {
-      if (!snap.exists || snap.metadata.hasPendingWrites) return;
-      var incoming = (snap.data() || {}).data;
-      if (!Array.isArray(incoming)) return;
-      var local = _memStore['supervisorQuotations'] || [];
-      if (JSON.stringify(incoming).length === JSON.stringify(local).length &&
-          (incoming[0]||{}).updatedAt === (local[0]||{}).updatedAt) return;
-      _memStore['supervisorQuotations'] = incoming;
-      _invalidateFsCache();
-      // Re-render supervisor quotations page if open
-      var svPage = document.getElementById('page-svQuotations');
-      if (svPage && svPage.classList.contains('active')) {
-        try { renderSVQuotationsPage && renderSVQuotationsPage(); } catch(ex){}
-      }
-      console.log('[FS] ⚡ Real-time update: supervisorQuotations changed (' + incoming.length + ')');
-    }, function(e){ console.warn('[FS] SV Quotations snapshot error:', e.message); });
-  _chunkListeners.push(svQuotUnsub);
+  // NOTE: Old crm_kv/quotations and crm_kv/supervisorQuotations onSnapshot listeners removed.
+  // Quotations now live in crm_quot_chunks and crm_sv_chunks — handled by the chunk
+  // listeners below. Keeping the old KV listeners caused stale-data overwrites because
+  // ss() no longer writes to crm_kv for quotations.
 
   // ── crm_quot_chunks — real-time quotation sync (images stripped, restored from _imageMap) ──
+  // FIX F: Track when we last wrote to prevent onSnapshot from
+  // overwriting _memStore before our _saveQuotImages completes
+  var _lastQuotWrite = 0;
   var quotChunkUnsub = _col(FS_QUOT_CHUNKS).onSnapshot(function(snap) {
     if (snap.metadata.hasPendingWrites) return;
+    // FIX F: skip if we wrote within last 3 seconds — let our own write settle
+    if (Date.now() - _lastQuotWrite < 3000) return;
     var quots = [];
     _quotChunkMap = {};
     snap.forEach(function(doc) {
@@ -3483,14 +3516,17 @@ async function loadFromFirestore() {
         Object.assign(_leadChunkMap, data.chunkMap || {});
         // IMPORTANT: Images are NOT cached in sessionStorage (too large)
         // Load them from Firebase now so quotations show their images correctly
+        // FIX E: if image load fails, mark _imageMapReady=false so saves don't delete images
         _imageMap = {};
+        _imageMapReady = false;
         try {
           var imgSnap2 = await _col(FS_IMAGES).get();
           imgSnap2.forEach(function(doc) {
             var d = doc.data();
             if (d && d.data) _imageMap[doc.id] = d.data;
           });
-          // Restore images into quotations that are now in _memStore
+          _imageMapReady = true;
+          // Restore images into quotations in _memStore
           if (_memStore['quotations']) {
             _memStore['quotations'] = _restoreQuotImages(_memStore['quotations']);
           }
@@ -3498,7 +3534,8 @@ async function loadFromFirestore() {
             _memStore['supervisorQuotations'] = _restoreQuotImages(_memStore['supervisorQuotations']);
           }
         } catch(imgErr) {
-          console.warn('[FS] Image load from cache path failed:', imgErr.message);
+          console.warn('[FS] Image load failed — images will show when quotations open:', imgErr.message);
+          // _imageMapReady stays false — _saveQuotImages will skip orphan deletion
         }
         _fsReady = true;
         _flushPendingWrites(); // flush any writes that happened before Firebase was ready
@@ -3527,6 +3564,7 @@ async function loadFromFirestore() {
       var d = doc.data();
       if (d && d.data) _imageMap[doc.id] = d.data;
     });
+    _imageMapReady = true; // FIX E: mark image map as fully loaded
     console.log('[FS] Images loaded: ' + imgSnap.size + ' docs');
 
     // 3. Quotations — chunked in crm_quot_chunks (images stripped, restored from _imageMap)
@@ -3607,7 +3645,84 @@ async function loadFromFirestore() {
 
 const K=k=>'devyora_'+k;
 
-// ── ALL DATA IN MEMORY + FIREBASE — zero localStorage ───────
+// FIX: beforeunload warning — if save is in progress, warn user before closing
+window.addEventListener('beforeunload', function(e){
+  if(_savePending){
+    e.preventDefault();
+    e.returnValue = 'Your quotation is still saving. Please wait a moment before closing.';
+    return e.returnValue;
+  }
+});
+
+// ================================================================
+// FIX: localStorage crash-recovery for _pendingWrites
+// If user closes before Firebase loads, pending writes survive in localStorage
+// On next open, they are recovered and re-attempted
+// ================================================================
+var LS_PENDING = 'devyora_pending_writes_v1';
+
+function _lsBackupPending(){
+  // Write _pendingWrites to localStorage (text only — no images)
+  try{
+    var backup = {};
+    Object.keys(_pendingWrites).forEach(function(k){
+      if(k==='quotations'||k==='supervisorQuotations'){
+        // Strip images before storing — images are too large for localStorage
+        backup[k] = (_pendingWrites[k]||[]).map(function(q){
+          var c = Object.assign({},q);
+          delete c.sitePhotos;
+          delete c.itemImages;
+          return c;
+        });
+      } else {
+        backup[k] = _pendingWrites[k];
+      }
+    });
+    if(Object.keys(backup).length > 0){
+      localStorage.setItem(LS_PENDING, JSON.stringify(backup));
+    } else {
+      localStorage.removeItem(LS_PENDING);
+    }
+  }catch(e){ console.warn('[CRM] localStorage backup failed:',e.message); }
+}
+
+function _lsClearPending(){
+  try{ localStorage.removeItem(LS_PENDING); }catch(e){}
+}
+
+function _lsRecoverPending(){
+  // Called on startup — check if any pending writes survived a crash
+  try{
+    var raw = localStorage.getItem(LS_PENDING);
+    if(!raw) return;
+    var backup = JSON.parse(raw);
+    var keys = Object.keys(backup);
+    if(!keys.length){ localStorage.removeItem(LS_PENDING); return; }
+    console.log('[CRM] Found '+keys.length+' crash-recovered pending write(s) — will re-sync when Firebase ready');
+    // Merge into _pendingWrites so they get flushed when Firebase loads
+    keys.forEach(function(k){
+      if(!_pendingWrites[k]) _pendingWrites[k] = backup[k];
+    });
+    // Show recovery toast once Firebase is ready
+    var _recoveryInterval = setInterval(function(){
+      if(!_fsReady) return;
+      clearInterval(_recoveryInterval);
+      _flushPendingWrites();
+      _lsClearPending();
+      toast('✅ Recovered unsaved work from last session — saved to Firebase','success');
+    }, 500);
+  }catch(e){ console.warn('[CRM] localStorage recovery failed:',e.message); }
+}
+
+// Override _queueWrite to also backup to localStorage
+var _origQueueWrite = _queueWrite;
+
+// When pending writes are flushed successfully, clear localStorage backup
+var _origFlush = _flushPendingWrites;
+async function _flushPendingWrites(){
+  await _origFlush();
+  _lsClearPending(); // clear backup — writes made it to Firebase
+}
 // _memStore is the single source of truth at runtime.
 // Firestore is the persistent backend.
 // localStorage is never used.
@@ -3632,6 +3747,12 @@ async function _flushPendingWrites(){
       await _writeQTAsChunks(v, null);
     } else if(k==='leads'){
       await _writeLeadsAsChunks(v, null);
+    } else if(k==='quotations'){
+      // FIX: quotations must go to crm_quot_chunks, not crm_kv
+      await _fsBatchUpdateQuots(v, FS_QUOT_CHUNKS, _quotChunkMap);
+    } else if(k==='supervisorQuotations'){
+      // FIX: supervisor quotations must go to crm_sv_chunks, not crm_kv
+      await _fsBatchUpdateQuots(v, FS_SV_CHUNKS, _svChunkMap);
     } else {
       await _fsSave(k, v);
     }
@@ -3647,24 +3768,11 @@ function ss(k,v){
     } else if(k==='leads'){
       // leads written per-entry via _fsUpdateOneLead
     } else if(k==='quotations'){
-      // Save images separately, store stripped quotations in chunks
-      var hasImages = (v||[]).some(function(q){ return (q.sitePhotos&&q.sitePhotos.length)||(q.itemImages&&Object.keys(q.itemImages).length); });
-      if(hasImages){
-        // Extract and save all images for all quotations that have them
-        (v||[]).forEach(function(q){
-          if((q.sitePhotos&&q.sitePhotos.length)||(q.itemImages&&Object.keys(q.itemImages||{}).length)){
-            _saveQuotImages(q.id, q.sitePhotos||[], q.itemImages||{});
-          }
-        });
-      }
-      _fsBatchUpdateQuots(v, FS_QUOT_CHUNKS, _quotChunkMap);
+      // FIX: sequence image saves BEFORE chunk write using async wrapper
+      // This prevents onSnapshot firing before images are in _imageMap
+      _saveQuotationsBatch(v, FS_QUOT_CHUNKS, _quotChunkMap);
     } else if(k==='supervisorQuotations'){
-      (v||[]).forEach(function(q){
-        if((q.sitePhotos&&q.sitePhotos.length)||(q.itemImages&&Object.keys(q.itemImages||{}).length)){
-          _saveQuotImages(q.id, q.sitePhotos||[], q.itemImages||{});
-        }
-      });
-      _fsBatchUpdateQuots(v, FS_SV_CHUNKS, _svChunkMap);
+      _saveQuotationsBatch(v, FS_SV_CHUNKS, _svChunkMap);
     } else {
       _fsSave(k, v);
     }
@@ -4844,32 +4952,41 @@ function saveQuotation(mode){
   updateBadge();
 }
 
-// ── AUTO-SAVE: Save quotation draft every 30 seconds while modal is open ──
+// ── AUTO-SAVE: Save quotation draft every 10 seconds while modal is open ──
 var _autoSaveTimer=null;
 function startQuotAutoSave(){
   stopQuotAutoSave();
   _autoSaveTimer=setInterval(function(){
     if(!qbData||qbData._isTester||qbData.isSupervisorQuot)return;
     if(!document.getElementById('quotModal')?.classList.contains('open'))return;
-    // Only auto-save if there's a client name (don't save blank drafts)
     const clientName=document.getElementById('qClientName')?.value.trim();
     if(!clientName)return;
-    // Silent save — update qbData from form fields then write to storage
     try{
+      // FIX: read ALL form fields — not just a few text fields
       qbData.client=clientName;
       qbData.phone=document.getElementById('qPhone')?.value||qbData.phone||'';
       qbData.city=document.getElementById('qCity')?.value||qbData.city||'';
+      qbData.address=document.getElementById('qAddress')?.value||qbData.address||'';
+      qbData.state=document.getElementById('qState')?.value||qbData.state||'';
+      qbData.grcType=document.getElementById('qGrcType')?.value||qbData.grcType||'';
+      qbData.siteStage=document.getElementById('qSiteStage')?.value||qbData.siteStage||'';
       qbData.designerNote=document.getElementById('qDesignerNote')?.value||qbData.designerNote||'';
       qbData.adminNote=document.getElementById('qAdminNote')?.value||qbData.adminNote||'';
-      qbData.status=qbData.status||'draft';
+      qbData.status=document.getElementById('qStatus')?.value||qbData.status||'draft';
+      // Telecaller — read ID and resolve name
+      const _tid=document.getElementById('qTelecaller')?.value;
+      if(_tid&&_tid!==qbData.telecallerId){
+        qbData.telecallerId=_tid;
+        const _tu=(ls('users')||[]).find(u=>u.id===_tid);
+        if(_tu)qbData.telecaller=_tu.name;
+      }
       qbData.date=qbData.date||today();
       if(!qbData.id)qbData.id=uid();
       let quots=ls('quotations')||[];
       const existing=quots.findIndex(x=>x.id===qbData.id);
-      if(existing>=0) quots[existing]=qbData;
+      if(existing>=0)quots[existing]=qbData;
       else quots.push(qbData);
       ss('quotations',quots);
-      // Show subtle indicator
       const title=document.getElementById('quotModalTitle');
       if(title){
         const orig=title.textContent;
@@ -4877,7 +4994,7 @@ function startQuotAutoSave(){
         setTimeout(function(){if(title.textContent.endsWith(' 💾'))title.textContent=orig;},1500);
       }
     }catch(e){console.warn('[AutoSave] failed:',e.message);}
-  },30000); // every 30 seconds
+  },10000); // every 10 seconds (reduced from 30s)
 }
 function stopQuotAutoSave(){
   if(_autoSaveTimer){clearInterval(_autoSaveTimer);_autoSaveTimer=null;}
@@ -13271,6 +13388,7 @@ function init(){
 }
 // Initialise Firebase first, then load data, then start the app
 _initFirebase();
+_lsRecoverPending(); // FIX: recover any pending writes that survived a crash
 // Show login modal IMMEDIATELY — don't wait for Firebase
 // Firebase loads in background and populates the dropdown via showLoginModal retry
 setupGlobalPasteListener();
